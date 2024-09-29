@@ -1197,6 +1197,9 @@ MML tags."
 				  ""
 				(concat " " (org-msg-get-to-name))))))
 	    (when (eq .style 'top-posting)
+	      (setq mml-content-disposition-alist
+		    (append (org-msg--mml-content-disposition-alist)
+			    mml-content-disposition-alist))
 	      (save-excursion
 		(insert "\n\n" org-msg-separator "\n")
 		(delete-region (line-beginning-position) (1+ (line-end-position)))
@@ -1212,7 +1215,12 @@ MML tags."
 	  (if (org-msg-message-fetch-field "to")
 	      (org-msg-goto-body)
 	    (message-goto-to))
-	  (org-msg-edit-mode))
+	  ;; Preserve the buffer-local value of user-mail-address to
+	  ;; ensure that message IDs generated from it will be using a
+	  ;; domain name that matches the sender.
+	  (let ((address user-mail-address))
+	    (org-msg-edit-mode)
+	    (setq-local user-mail-address address)))
 	(set-buffer-modified-p nil)))))
 
 (defun org-msg-post-setup--if-not-reply (&rest args)
@@ -1343,16 +1351,24 @@ This function is used as an advice function of
 	   (goto-char citation-start))
 	 (re-search-forward ,regexp (point-max) t)))))
 
+(defun org-msg--mml-content-disposition-alist ()
+  "Return the appropriate per-file MIME disposition."
+  (mapcar (lambda (x)
+	    (cons (concat x ".*") "inline"))
+	  (org-msg-get-prop "reply-to")))
+
 (defun org-msg-kill-buffer ()
   "Delete temporary files."
-  (let ((files (org-msg-get-prop "reply-to")))
-    (dolist (file files)
-      (when (and (not (string= "" file)) (file-exists-p file))
-	(cond ((file-directory-p file) (delete-directory file t))
-	      ((delete-file file)))))
-    (when org-msg-mml-buffer-list
-      (let ((mml-buffer-list org-msg-mml-buffer-list))
-	(mml-destroy-buffers)))))
+  (dolist (file (org-msg-get-prop "reply-to"))
+    (when (and (not (string= "" file)) (file-exists-p file))
+      (cond ((file-directory-p file) (delete-directory file t))
+	    ((delete-file file)))))
+  (dolist (disposition (org-msg--mml-content-disposition-alist))
+    (setq mml-content-disposition-alist
+	  (delete disposition mml-content-disposition-alist)))
+  (when org-msg-mml-buffer-list
+    (let ((mml-buffer-list org-msg-mml-buffer-list))
+      (mml-destroy-buffers))))
 
 (defun org-msg-store-mml-buffers ()
   "Locally store the list of MML temporary buffers."
@@ -1470,45 +1486,40 @@ HTML emails."
 	  nil)))
   "Additional expressions to highlight in OrgMsg mode.")
 
+(defun org-msg--mu4e-fun (name)
+  "Attempt to find the existing mu4e function suffixed with NAME."
+  (let ((funs (mapcar (lambda (prefix) (intern (concat prefix name)))
+		      '("mu4e~" "mu4e-" "mu4e--"))))
+    (car (cl-member-if #'fboundp funs))))
+
+(defun org-msg--mu4e-fun-call (name)
+  "Call the mu4e function suffixed with NAME if any."
+  (when-let ((fun (org-msg--mu4e-fun name)))
+    (funcall fun)))
+
 (defun org-msg-edit-mode-mu4e ()
   "Setup mu4e faces, addresses completion and run mu4e."
-  (mu4e~compose-remap-faces)
+  (org-msg--mu4e-fun-call "compose-remap-faces")
   (unless (mu4e-running-p)
-    (if (fboundp #'mu4e~start) (mu4e~start) (mu4e--start)))
+    (org-msg--mu4e-fun-call "start"))
   (when mu4e-compose-complete-addresses
-    (mu4e~compose-setup-completion))
-  ;; the following code is verbatim from mu4e-compose.el, `mu4e-compose-mode'
-  ;; this will setup fcc (saving sent messages) and handle flags
-  ;; (e.g. replied to)
-  (add-hook 'message-send-hook
-	    (if (functionp #'mu4e~setup-fcc-message-sent-hook-fn)
-		#'mu4e~setup-fcc-message-sent-hook-fn
-	      (lambda ()
-		;; when in-reply-to was removed, remove references as well.
-		(when (eq mu4e-compose-type 'reply)
-		  (mu4e~remove-refs-maybe))
-		(when use-hard-newlines
-		  (mu4e-send-harden-newlines))
-		;; for safety, always save the draft before sending
-		(set-buffer-modified-p t)
-		(save-buffer)
-		(mu4e~compose-setup-fcc-maybe)
-		(widen)))
-	    nil t)
-  ;; when the message has been sent.
-  (add-hook 'message-sent-hook
-	    (if (functionp #'mu4e~set-sent-handler-message-sent-hook-fn)
-		#'mu4e~set-sent-handler-message-sent-hook-fn
-	      (lambda ()
-		(setq mu4e-sent-func 'mu4e-sent-handler)
-		(mu4e~proc-sent (buffer-file-name))))
-	    nil t))
+    (org-msg--mu4e-fun-call "compose-setup-completion"))
+  (when-let ((sent-hook (org-msg--mu4e-fun "compose-before-send")))
+    (add-hook 'message-sent-hook sent-hook nil t)))
 
 (defalias 'org-msg-edit-kill-buffer-mu4e 'mu4e-message-kill-buffer)
 
 (defun org-msg-edit-kill-buffer ()
   (interactive)
   (org-msg-mua-call 'edit-kill-buffer 'message-kill-buffer))
+
+(defun org-msg-insert-recipient-mailto()
+  "Insert a mailto link to a recipient."
+  (interactive)
+  (let* ((recipients (message-all-recipients))
+	 (name (completing-read "Recipient: " recipients nil t))
+	 (address (car (assoc-default name recipients))))
+    (org-insert-link nil (concat "mailto:" address) (concat "@" name))))
 
 (defvar org-msg-edit-mode-map
   (let ((map (make-sparse-keymap)))
@@ -1518,6 +1529,7 @@ HTML emails."
     (define-key map (kbd "C-c C-k") 'org-msg-edit-kill-buffer)
     (define-key map (kbd "C-c C-s") 'message-goto-subject)
     (define-key map (kbd "C-c C-b") 'org-msg-goto-body)
+    (define-key map (kbd "C-c @") 'org-msg-insert-recipient-mailto)
     (define-key map [remap org-attach] 'org-msg-attach)
     map)
   "Keymap for `org-msg-edit-mode'.")
